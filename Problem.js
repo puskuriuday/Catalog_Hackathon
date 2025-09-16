@@ -1,37 +1,59 @@
 
+const fs = require("fs");
+const path = require("path");
 
-const fs = require('fs');
-const path = require('path');
+// ---------------- BigInt helpers ----------------
+const absBI = (a) => (a < 0n ? -a : a);
+function gcdBI(a, b) {
+  a = absBI(a);
+  b = absBI(b);
+  while (b !== 0n) {
+    const t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
 
-// ---------------- BigInt Fraction ----------------
-const absBI = a => (a < 0n ? -a : a);
-function gcdBI(a, b) { a = absBI(a); b = absBI(b); while (b !== 0n) { [a, b] = [b, a % b]; } return a; }
-
+// ---------------- Fraction over BigInt ----------------
 class Frac {
   constructor(n, d = 1n) {
-    if (d === 0n) throw new Error('Division by zero');
-    if (d < 0n) { n = -n; d = -d; }
+    if (d === 0n) throw new Error("Division by zero");
+    if (d < 0n) {
+      n = -n;
+      d = -d;
+    }
     const g = gcdBI(absBI(n), d);
     this.n = n / g;
     this.d = d / g;
   }
-  static fromBI(x) { return new Frac(x, 1n); }
-  add(o) { return new Frac(this.n * o.d + o.n * this.d, this.d * o.d); }
-  sub(o) { return new Frac(this.n * o.d - o.n * this.d, this.d * o.d); }
-  mul(o) { return new Frac(this.n * o.n, this.d * o.d); }
-  div(o) { if (o.n === 0n) throw new Error('Division by zero'); return new Frac(this.n * o.d, this.d * o.n); }
-  isInt() { return this.d === 1n; }
-  toString() { return this.isInt() ? this.n.toString() : `${this.n}/${this.d}`; }
+  static fromBI(x) {
+    return new Frac(x, 1n);
+  }
+  add(o) {
+    return new Frac(this.n * o.d + o.n * this.d, this.d * o.d);
+  }
+  mul(o) {
+    return new Frac(this.n * o.n, this.d * o.d);
+  }
+  isInt() {
+    return this.d === 1n;
+  }
+  toString() {
+    return this.isInt() ? this.n.toString() : `${this.n}/${this.d}`;
+  }
 }
 
-// ---------------- Base parsing ----------------
+// ---------------- Base decoding ----------------
 function charToVal(ch) {
   const c = ch.toLowerCase();
-  if (c >= '0' && c <= '9') return BigInt(c.charCodeAt(0) - 48);
-  if (c >= 'a' && c <= 'z') return 10n + BigInt(c.charCodeAt(0) - 97);
+  if (c >= "0" && c <= "9") return BigInt(c.charCodeAt(0) - 48);
+  if (c >= "a" && c <= "z") return 10n + BigInt(c.charCodeAt(0) - 97);
   throw new Error(`Invalid digit '${ch}'`);
 }
 function parseBaseToBigInt(str, base) {
+  if (!(base >= 2 && base <= 36))
+    throw new Error(`Unsupported base ${base} (2..36)`);
   const b = BigInt(base);
   let acc = 0n;
   for (const ch of str) {
@@ -42,85 +64,55 @@ function parseBaseToBigInt(str, base) {
   return acc;
 }
 
-// ---------------- JSON IO ----------------
+// ---------------- JSON input ----------------
 function loadTestCase(filePath) {
-  const raw = fs.readFileSync(path.resolve(process.cwd(), filePath), 'utf8');
+  const raw = fs.readFileSync(path.resolve(process.cwd(), filePath), "utf8");
   const data = JSON.parse(raw);
   const k = data?.keys?.k;
   const n = data?.keys?.n;
-  if (typeof k !== 'number' || typeof n !== 'number') throw new Error('Invalid JSON: missing keys.n or keys.k');
-
+  if (typeof k !== "number" || typeof n !== "number") {
+    throw new Error("Invalid JSON: missing keys.n or keys.k");
+  }
   const pts = [];
   for (const key of Object.keys(data)) {
-    if (key === 'keys') continue;
-    const entry = data[key];
-    if (!entry || typeof entry.base !== 'string' || typeof entry.value !== 'string') continue;
-    pts.push({
-      x: BigInt(key),
-      y: parseBaseToBigInt(entry.value, parseInt(entry.base, 10)),
-      base: parseInt(entry.base, 10),
-      valueStr: entry.value
-    });
+    if (key === "keys") continue;
+    const e = data[key];
+    if (!e) continue;
+    const base = parseInt(e.base, 10);
+    const y = parseBaseToBigInt(e.value, base);
+    pts.push({ x: BigInt(key), y });
   }
   pts.sort((a, b) => (a.x < b.x ? -1 : a.x > b.x ? 1 : 0));
+  if (pts.length < k)
+    throw new Error(`Need at least k=${k} points, got ${pts.length}`);
   return { k, n, points: pts };
 }
 
-// ---------------- Linear system (Gaussian elimination over Frac) ----------------
-function powBI(base, exp) {
-  let r = 1n, b = base, e = BigInt(exp);
-  while (e > 0n) { if (e & 1n) r *= b; b *= b; e >>= 1n; }
-  return r;
-}
+// ---------------- Lagrange at x=0 (O(k^2)) ----------------
+function constantViaLagrange(points) {
+  const k = points.length;
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
 
-// Build Vandermonde-like row for x: [x^m, x^(m-1), ..., x^1, 1]
-function vandermondeRow(xBI, m) {
-  const row = [];
-  for (let e = m; e >= 1; e--) row.push(Frac.fromBI(powBI(xBI, e)));
-  row.push(Frac.fromBI(1n));
-  return row;
-}
-
-function deepCopyMatrix(A) { return A.map(row => row.map(el => new Frac(el.n, el.d))); }
-
-function solveFracSystem(A, b) {
-  // A: k x k (Frac), b: k (Frac) → returns x: k (Frac)
-  const k = A.length;
-  // Build augmented matrix [A|b]
-  const M = A.map((row, i) => [...row, b[i]]);
-  // Forward elimination
-  for (let col = 0; col < k; col++) {
-    // Find pivot
-    let piv = col;
-    for (let r = col; r < k; r++) {
-      if (M[r][col].n !== 0n) { piv = r; break; }
+  let acc = Frac.fromBI(0n);
+  for (let i = 0; i < k; i++) {
+    let num = 1n,
+      den = 1n;
+    const xi = xs[i];
+    for (let j = 0; j < k; j++) {
+      if (j === i) continue;
+      num *= -xs[j]; // multiply by (-x_j)
+      den *= xi - xs[j]; // multiply by (x_i - x_j)
     }
-    if (M[piv][col].n === 0n) throw new Error('Singular matrix (no unique solution)');
-    // Swap
-    if (piv !== col) { const tmp = M[col]; M[col] = M[piv]; M[piv] = tmp; }
-    // Normalize pivot row
-    const pivotVal = M[col][col];
-    for (let c = col; c <= k; c++) M[col][c] = M[col][c].div(pivotVal);
-    // Eliminate below
-    for (let r = col + 1; r < k; r++) {
-      const factor = M[r][col];
-      if (factor.n === 0n) continue;
-      for (let c = col; c <= k; c++) {
-        M[r][c] = M[r][c].sub(factor.mul(M[col][c]));
-      }
-    }
+    const li0 = new Frac(num, den);
+    acc = acc.add(li0.mul(Frac.fromBI(ys[i])));
   }
-  // Back substitution
-  const x = Array(k).fill(null).map(() => Frac.fromBI(0n));
-  for (let r = k - 1; r >= 0; r--) {
-    let sum = Frac.fromBI(0n);
-    for (let c = r + 1; c < k; c++) sum = sum.add(M[r][c].mul(x[c]));
-    x[r] = M[r][k].sub(sum); // pivot is 1 after normalization
-  }
-  return x;
+  if (!acc.isInt())
+    throw new Error(`Non-integer constant term: ${acc.toString()}`);
+  return acc.n;
 }
 
-// ---------------- Helpers for subsets (optional consistency search) ----------------
+// ---------------- Subset generation (k-combinations) ----------------
 function* kCombinations(arr, k) {
   const n = arr.length;
   const idx = Array.from({ length: k }, (_, i) => i);
@@ -135,110 +127,109 @@ function* kCombinations(arr, k) {
   }
 }
 
-function arrayEq(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-
-// ---------------- Core solve (substitution) ----------------
-function solveBySubstitution(points, k, tryAllSubsets = false) {
-  const m = k - 1;
-  const xs = points.map(p => p.x);
-  const ys = points.map(p => p.y);
-
-  function solveForIndices(idxs) {
-    const rows = [];
-    const b = [];
-    for (const ii of idxs) {
-      rows.push(vandermondeRow(xs[ii], m));
-      b.push(Frac.fromBI(ys[ii]));
-    }
-    const coeffs = solveFracSystem(rows, b); // [a_m, a_{m-1}, ..., a_0] (Fractions)
-    return coeffs;
-  }
-
-  if (!tryAllSubsets) {
-    // Use the consistent set of points: {1,3,4,5,6,7,9} excluding outliers x=2,8
-    const consistentXValues = [1n, 3n, 4n, 5n, 6n, 7n, 9n, 10n];
-    const idxs = [];
-    
-    // Find indices of points with x-values in our consistent set
-    for (const targetX of consistentXValues) {
-      const idx = points.findIndex(p => p.x === targetX);
-      if (idx !== -1) {
-        idxs.push(idx);
-      }
-      if (idxs.length === k) break; // We only need k points
-    }
-    
-    if (idxs.length < k) {
-      // Fallback to first k points if we can't find enough consistent ones
-      const fallbackIdxs = Array.from({ length: k }, (_, i) => i);
-      const coeffs = solveForIndices(fallbackIdxs);
-      return { coeffs, used_indices: fallbackIdxs };
-    }
-    
-    const coeffs = solveForIndices(idxs);
-    return { coeffs, used_indices: idxs };
-  }
-
-  // Try all k-combinations, vote for most frequent a0 (f(0))
-  const n = points.length;
-  const votes = new Map(); // key: a0 string, value: {count, example:{coeffs, idxs}}
-  for (const idxs of kCombinations(Array.from({ length: n }, (_, i) => i), k)) {
-    try {
-      const coeffs = solveForIndices(idxs);
-      const a0 = coeffs[coeffs.length - 1].toString();
-      const entry = votes.get(a0) || { count: 0, example: { coeffs, idxs } };
-      entry.count++;
-      votes.set(a0, entry);
-    } catch (_) {
-      // singular / bad subset — ignore
-    }
-  }
-  // Pick the winner
-  let bestKey = null;
-  let best = null;
-  for (const [key, val] of votes.entries()) {
-    if (!best || val.count > best.count) { best = val; bestKey = key; }
-  }
-  if (!best) throw new Error('No solvable subsets found');
-  return { coeffs: best.example.coeffs, used_indices: best.example.idxs, votes_summary: [...votes.entries()].map(([k,v])=>({ a0:k, count:v.count })) };
-}
-
-// ---------------- Pretty print ----------------
-function fmtCoeffs(coeffs) {
-  // coeffs: [a_m, ..., a_0]
-  const out = {};
-  const m = coeffs.length - 1;
-  coeffs.forEach((f, i) => {
-    const name = `a_${m - i}`;
-    out[name] = f.toString();
+// ---------------- CLI helpers ----------------
+function parsePickArg(argv) {
+  const pickArg = argv.find((a) => a.startsWith("--pick="));
+  if (!pickArg) return null;
+  const raw = pickArg.slice("--pick=".length).trim();
+  if (!raw) return null;
+  const parts = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) return null;
+  const keys = parts.map((s) => {
+    if (!/^-?\d+$/.test(s))
+      throw new Error(`--pick contains non-integer: '${s}'`);
+    return BigInt(s);
   });
-  return out;
+  // dedupe
+  const seen = new Set(),
+    unique = [];
+  for (const v of keys) {
+    const k = v.toString();
+    if (!seen.has(k)) {
+      seen.add(k);
+      unique.push(v);
+    }
+  }
+  return unique;
 }
 
-// ---------------- Main CLI ----------------
+// ---------------- Main ----------------
 if (require.main === module) {
   const file = process.argv[2];
-  const tryAll = process.argv.includes('--find-consistent');
-
   if (!file) {
-    console.error('Usage: node solve_substitution.js <jsonFile> [--find-consistent]');
+    console.error(
+      "Usage: node secret_consistent.js <jsonFile> [--pick=x1,...,xk]",
+    );
     process.exit(1);
   }
 
   try {
     const { k, n, points } = loadTestCase(file);
-    const { coeffs, used_indices, votes_summary } = solveBySubstitution(points, k, tryAll);
 
-    const a0 = coeffs[coeffs.length - 1]; // constant term
+    // If user forces a subset via --pick, use it directly
+    const chosenXs = parsePickArg(process.argv);
+    if (chosenXs) {
+      if (chosenXs.length !== k) {
+        throw new Error(
+          `--pick must specify exactly k=${k} x-keys; got ${chosenXs.length}`,
+        );
+      }
+      const map = new Map(points.map((p, i) => [p.x.toString(), i]));
+      const subset = chosenXs.map((x) => {
+        const idx = map.get(x.toString());
+        if (idx === undefined)
+          throw new Error(`--pick refers to missing x=${x.toString()}`);
+        return points[idx];
+      });
+      const c = constantViaLagrange(subset);
+      console.log(`constant = ${c.toString()}`);
+      process.exit(0);
+    }
 
-    // Only print the secret value in the required format
-    console.log(`constant = ${a0.n.toString()}`);
+    // If n == k, compute once
+    if (n === k || points.length === k) {
+      const c = constantViaLagrange(points.slice(0, k));
+      console.log(`constant = ${c.toString()}`);
+      process.exit(0);
+    }
+
+    // n > k: vote across all k-subsets; pick most frequent integer constant
+    const idxs = [...Array(points.length).keys()];
+    const counts = new Map(); // constant(BigInt)->count
+    const example = new Map(); // constant(BigInt)->subset indices
+
+    for (const combo of kCombinations(idxs, k)) {
+      const subset = combo.map((i) => points[i]);
+      try {
+        const c = constantViaLagrange(subset);
+        const key = c.toString();
+        counts.set(key, (counts.get(key) || 0) + 1);
+        if (!example.has(key)) example.set(key, combo.slice());
+      } catch (_) {
+        // Non-integer or singular subset; ignore
+      }
+    }
+
+    if (counts.size === 0)
+      throw new Error("No consistent (integer) subsets found");
+
+    // Pick the constant with maximum votes
+    let bestConst = null,
+      bestCount = -1;
+    for (const [kstr, ct] of counts.entries()) {
+      if (ct > bestCount) {
+        bestCount = ct;
+        bestConst = kstr;
+      }
+    }
+
+    // Final answer
+    console.log(`constant = ${bestConst}`);
   } catch (e) {
-    console.error('Error:', e.message);
+    console.error("Error:", e.message);
     process.exit(1);
   }
 }
